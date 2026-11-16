@@ -4,7 +4,9 @@ from contextlib import redirect_stdout
 import csv
 import io
 import json
+import os
 from pathlib import Path
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -157,6 +159,25 @@ class RegistryReviewTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'IMU2'):
                 with redirect_stdout(io.StringIO()):
                     evaluate_model.run(args)
+
+    def test_emoji_note_does_not_stop_training_when_output_is_piped(self):
+        # Windows pipes/log files default to cp949, which cannot encode emoji
+        # (ALIGN-data notes link Notion pages with a bug icon).
+        with tempfile.TemporaryDirectory() as tmp:
+            data = test_training.TrainingTests.build_data(None, tmp)
+            (data / f'P01_{self.BAD_SID}_label0.csv').write_bytes(zero_imu2_csv_bytes(self.BAD_SID))
+            lines = ['session_id,date,subject,condition,label,mount,status,note']
+            lines += [f'session{i},2026-11-13,P01,body,{i % 2},unrecorded,ok,' for i in range(4)]
+            lines.append(f'{self.BAD_SID},2026-11-13,P01,body,0,unrecorded,exclude,IMU2 \U0001f41e')
+            (Path(tmp) / 'sessions.csv').write_text('\n'.join(lines) + '\n', encoding='utf-8')
+            env = {k: v for k, v in os.environ.items() if k not in ('PYTHONIOENCODING', 'PYTHONUTF8')}
+            script = Path(train_model.__file__).resolve()
+            done = subprocess.run(
+                [sys.executable, str(script), '--data', str(data), '--kind', 'hand',
+                 '--out', str(Path(tmp) / 'out')],
+                capture_output=True, env=env, cwd=script.parent, timeout=120)
+            self.assertEqual(done.returncode, 0, done.stderr.decode('utf-8', 'replace'))
+            self.assertIn('IMU2 \U0001f41e', done.stdout.decode('utf-8'))
 
 
 if __name__ == '__main__':

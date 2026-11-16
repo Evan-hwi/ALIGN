@@ -13,7 +13,7 @@ import zipfile
 
 from common import load_model, predict
 from train_model import (add_registry_arguments, load_sessions, metrics,
-                         print_registry_report, resolve_registry)
+                         print_registry_report, resolve_registry, use_utf8_output)
 
 
 def training_manifest(model):
@@ -141,6 +141,7 @@ def main(argv=None):
     parser.add_argument("--out", required=True, help="새 결과 폴더")
     add_registry_arguments(parser)
     args = parser.parse_args(argv)
+    use_utf8_output()
     try:
         run(args)
         return 0

@@ -66,6 +66,17 @@ def add_registry_arguments(parser):
     group.add_argument("--no-sessions", action="store_true", help="sessions.csv를 무시하고 모든 세션 사용")
 
 
+def use_utf8_output():
+    """Print UTF-8 even when Windows redirects output in cp949 (pipes, log files).
+
+    sessions.csv notes can hold emoji such as Notion's bug icon; printing one in
+    cp949 raised UnicodeEncodeError and stopped the whole run.
+    """
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(encoding="utf-8", errors="replace")
+
+
 def print_registry_report(registry_path, info):
     if registry_path is None:
         print("세션 기록(sessions.csv)을 사용하지 않았습니다. 폴더의 모든 세션을 씁니다.")
@@ -443,6 +454,7 @@ def main(argv=None):
     parser.add_argument("--overwrite", action="store_true", help="기존 model/evaluation 교체 허용")
     add_registry_arguments(parser)
     args = parser.parse_args(argv)
+    use_utf8_output()
     try:
         run(args)
         return 0
