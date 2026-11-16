@@ -12,6 +12,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 import sys
 import zipfile
 
@@ -21,6 +22,43 @@ from common import CHANNELS, WindowBuffer, fit_model, parse_sample, predict
 EXPECTED_FIELDS = ["session_id", "subject_id", "label", "seq", "time_us"] + list(CHANNELS)
 MAX_CSV_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
+# 센서 하나의 6채널이 전부 0인 행이 이 비율 이상이면 빈 센서로 보고 학습을 멈춘다.
+ZERO_SENSOR_RATIO = 0.01
+REGISTRY_NAME = "sessions.csv"
+REGISTRY_SEARCH_LEVELS = 3
+REGISTRY_STATUSES = {"ok", "check", "exclude"}
+SESSION_ID_IN_NAME = re.compile(r"(\d{8}_\d{6}_[0-9a-f]{8})_label[01]\.csv$")
+
+
+def find_registry(source: Path):
+    """Return the nearest sessions.csv at or above the data folder (ALIGN-data layout)."""
+    folder = source if source.is_dir() else source.parent
+    for candidate in [folder, *folder.parents][:REGISTRY_SEARCH_LEVELS + 1]:
+        path = candidate / REGISTRY_NAME
+        if path.is_file():
+            return path
+    return None
+
+
+def load_registry(path: Path):
+    """Read session_id -> status/note from the ALIGN-data session registry."""
+    try:
+        text = path.read_text(encoding="utf-8-sig")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path.name}을 읽을 수 없습니다: {exc}") from exc
+    reader = csv.DictReader(io.StringIO(text, newline=""))
+    if not reader.fieldnames or not {"session_id", "status"} <= set(reader.fieldnames):
+        raise ValueError(f"{path.name}에 session_id, status 열이 필요합니다.")
+    registry = {}
+    for row in reader:
+        sid = (row.get("session_id") or "").strip()
+        if not sid:
+            continue
+        status = (row.get("status") or "").strip()
+        if status not in REGISTRY_STATUSES:
+            raise ValueError(f"{path.name}:{reader.line_num}: status는 ok/check/exclude 중 하나여야 합니다.")
+        registry[sid] = {"status": status, "note": (row.get("note") or "").strip()}
+    return registry
 
 
 def input_csvs(source: Path):
@@ -68,6 +106,7 @@ def read_session(name: str, content: bytes):
     features = []
     source_window_ends = []
     rows = gaps = timing_anomalies = near_scale = interruptions = 0
+    zero_rows = [0, 0]
     signal_hash = hashlib.sha256()
     try:
         for row in reader:
@@ -98,6 +137,8 @@ def read_session(name: str, content: bytes):
             rows += 1
             near_scale += int(any(abs(v) >= (1.98 if i % 6 < 3 else 247.5)
                                   for i, v in enumerate(values)))
+            for k in (0, 1):
+                zero_rows[k] += all(v == 0.0 for v in values[6 * k:6 * k + 6])
             # Ignore metadata and time for this fingerprint: relabeling or copying
             # a recording under a fresh session ID must not leak across folds.
             signal_hash.update(json.dumps(values, separators=(",", ":"), allow_nan=False).encode("ascii"))
@@ -111,6 +152,11 @@ def read_session(name: str, content: bytes):
         raise ValueError(f"{name}:{reader.line_num}: CSV 문법 오류: {exc}") from exc
     if not rows:
         raise ValueError(f"{name}: 데이터 행이 없습니다.")
+    for k in (0, 1):
+        if zero_rows[k] >= rows * ZERO_SENSOR_RATIO:
+            raise ValueError(
+                f"{name}: IMU{k + 1}의 6채널이 전부 0인 행이 {zero_rows[k]}/{rows}개입니다 (빈 센서 의심). "
+                f"sessions.csv에서 이 세션을 status=exclude로 표시하세요.")
     if not features:
         raise ValueError(f"{name}: 연속된 유효 50행 구간이 없습니다. 누락·시간 간격·포화를 확인하세요.")
     return {
@@ -126,11 +172,37 @@ def read_session(name: str, content: bytes):
     }
 
 
-def load_sessions(source: Path):
+def load_sessions(source: Path, registry="auto", report=None):
+    """Load sessions; skip those marked exclude in sessions.csv.
+
+    registry: "auto" finds sessions.csv at or above the data folder, None ignores it,
+    or pass a Path. report (dict), if given, receives what was used and skipped.
+    """
+    if registry == "auto":
+        registry = find_registry(source)
+    entries = load_registry(Path(registry)) if registry else None
+    info = {"registry": Path(registry).name if registry else None,
+            "registry_sha256": hashlib.sha256(Path(registry).read_bytes()).hexdigest() if registry else None,
+            "excluded": [], "check": [], "unregistered": []}
     sessions = []
     seen_ids, seen_signals, seen_files = {}, {}, {}
     for name, data in input_csvs(source):
+        match = SESSION_ID_IN_NAME.search(name)
+        entry = entries.get(match.group(1)) if entries is not None and match else None
+        if entry and entry["status"] == "exclude":
+            # Skip before parsing: excluded sessions are often the malformed ones.
+            info["excluded"].append({"session_id": match.group(1), "file": name, "note": entry["note"]})
+            continue
         session = read_session(name, data)
+        if entries is not None:
+            entry = entries.get(session["session_id"])
+            if entry is None:
+                info["unregistered"].append(session["session_id"])
+            elif entry["status"] == "exclude":
+                info["excluded"].append({"session_id": session["session_id"], "file": name, "note": entry["note"]})
+                continue
+            elif entry["status"] == "check":
+                info["check"].append(session["session_id"])
         for key, seen, message in (
                 ("session_id", seen_ids, "세션 ID가 중복"),
                 ("sha256", seen_files, "동일한 CSV 파일이 중복"),
@@ -140,6 +212,10 @@ def load_sessions(source: Path):
                 raise ValueError(f"{message}입니다: {seen[value]} / {name}. 중복 사본을 제외하세요.")
             seen[value] = name
         sessions.append(session)
+    if not sessions:
+        raise ValueError("학습에 쓸 세션이 없습니다. sessions.csv에서 모두 exclude로 표시되었는지 확인하세요.")
+    if report is not None:
+        report.update(info)
     return sorted(sessions, key=lambda s: (s["session_id"], s["file"]))
 
 
@@ -235,10 +311,31 @@ def run(args):
         exists = [p for p in (out / "model.json", out / "evaluation.json") if p.exists()]
         if exists:
             raise ValueError(f"결과가 이미 있습니다: {exists[0]}. 새 --out 폴더를 사용하세요. 의도한 교체는 --overwrite로 실행합니다.")
-    sessions = load_sessions(source)
+    if getattr(args, "no_sessions", False):
+        registry = None
+    elif getattr(args, "sessions", None):
+        registry = Path(args.sessions).expanduser().resolve()
+        if not registry.is_file():
+            raise ValueError(f"세션 기록 파일이 없습니다: {registry}")
+    else:
+        registry = "auto"
+    registry_info = {}
+    sessions = load_sessions(source, registry, registry_info)
+    if registry_info.get("registry"):
+        print(f"세션 기록: {registry_info['registry']} 사용 · 제외 {len(registry_info['excluded'])}세션")
+        for item in registry_info["excluded"]:
+            print(f"  제외: {item['session_id']} ({item['note'] or '사유 없음'})")
+        if registry_info["check"]:
+            print(f"  확인 필요(check)로 표시된 세션 {len(registry_info['check'])}개를 포함했습니다: "
+                  + ", ".join(registry_info["check"]))
+        if registry_info["unregistered"]:
+            print(f"  경고: sessions.csv에 없는 세션 {len(registry_info['unregistered'])}개를 포함했습니다.")
+    else:
+        print("세션 기록(sessions.csv)을 사용하지 않았습니다. 폴더의 모든 세션을 학습에 씁니다.")
     evaluation = evaluate(sessions, args.split)
     public_sessions = [{k: v for k, v in s.items() if k not in ("features", "window_ends")} for s in sessions]
     evaluation["input_sessions"] = public_sessions
+    evaluation["session_registry"] = registry_info
     all_features, all_labels = flatten(sessions, range(len(sessions)))
     params = fit_model(all_features, all_labels)
     model = {
@@ -250,8 +347,10 @@ def run(args):
         "training_sessions": [s["session_id"] for s in sessions],
         "training_subjects": sorted({s["subject_id"] for s in sessions}),
         "training_files": public_sessions, "training_windows": len(all_features),
+        "session_registry": registry_info,
         "evaluation": {k: v for k, v in evaluation.items()
-                       if k not in ("input_sessions", "predictions", "folds", "session_votes")},
+                       if k not in ("input_sessions", "predictions", "folds", "session_votes",
+                                    "session_registry")},
         "units": {"acceleration": "g", "gyroscope": "deg/s"},
         "scope": "hand-tilted sensor demonstration" if args.kind == "hand" else "body-worn experimental classifier",
     }
@@ -282,6 +381,9 @@ def main(argv=None):
     parser.add_argument("--split", choices=("session", "subject"), default="session")
     parser.add_argument("--out", required=True, help="새 결과 폴더")
     parser.add_argument("--overwrite", action="store_true", help="기존 model/evaluation 교체 허용")
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--sessions", help="세션 기록 파일(sessions.csv). 생략하면 데이터 폴더와 상위 3단계에서 자동으로 찾음")
+    group.add_argument("--no-sessions", action="store_true", help="sessions.csv를 무시하고 모든 세션 사용")
     args = parser.parse_args(argv)
     try:
         run(args)
