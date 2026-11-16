@@ -8,10 +8,11 @@
 
 모든 세션을 한 줄씩 적는 장부입니다. 열은 `session_id, date, subject, condition, label, mount, status, note`이고, 자세한 규칙은 ALIGN-data README에 있습니다.
 
-- `status=exclude`인 세션은 `train_model.py`·`evaluate_model.py`가 **자동으로 뺍니다.** 데이터 폴더와 그 위 3단계 폴더에서 `sessions.csv`를 찾고, 학습 결과(`model.json`, `evaluation.json`)의 `session_registry`에 제외한 세션과 사유를 남깁니다.
-- `status=check` 세션과 장부에 없는 세션은 포함하되 경고를 출력합니다.
+- `status=exclude`인 세션은 `train_model.py`·`evaluate_model.py`가 **자동으로 뺍니다.** 데이터 폴더부터 위로 올라가며 `sessions.csv`를 찾되 그 데이터가 든 Git 저장소 밖으로는 나가지 않고(최대 3단계), 사용한 장부 경로를 출력합니다. 학습 결과(`model.json`)와 평가 결과(`evaluation.json`)의 `session_registry`에 제외한 세션과 사유를 남깁니다. 파일 이름이 로거 형식이 아니어도 CSV 첫 행의 `session_id`로 제외를 적용합니다.
+- `status=check` 세션, 장부에 없는 세션, 장부와 CSV의 `label`이 다른 세션은 포함하되 경고를 출력합니다.
+- 장부에 같은 `session_id`가 두 줄 있으면 멈춥니다. 한 줄로 합치세요.
 - 다른 장부를 쓰려면 `--sessions 경로`, 장부를 무시하려면 `--no-sessions`를 붙입니다.
-- 센서 하나의 6채널이 전부 0인 행이 1% 이상인 세션은 학습이 멈춥니다. 원인을 확인하고 장부에서 `exclude`로 표시하세요.
+- 센서 하나의 6채널이 전부 0인 행이 1% 이상이면서 5행 이상인 세션은 학습·평가가 멈춥니다. 원인을 확인하고 장부에서 `exclude`로 표시하세요.
 
 특이사항의 원인·사진·해결 과정은 노션 🐞 트러블슈팅에 쓰고, 장부의 `note`에 링크를 남깁니다.
 

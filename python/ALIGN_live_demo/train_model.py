@@ -22,8 +22,9 @@ from common import CHANNELS, WindowBuffer, fit_model, parse_sample, predict
 EXPECTED_FIELDS = ["session_id", "subject_id", "label", "seq", "time_us"] + list(CHANNELS)
 MAX_CSV_BYTES = 128 * 1024 * 1024
 MAX_TOTAL_BYTES = 1024 * 1024 * 1024
-# 센서 하나의 6채널이 전부 0인 행이 이 비율 이상이면 빈 센서로 보고 학습을 멈춘다.
+# 센서 하나의 6채널이 전부 0인 행이 이 비율 이상(그리고 최소 행 수 이상)이면 빈 센서로 보고 멈춘다.
 ZERO_SENSOR_RATIO = 0.01
+ZERO_SENSOR_MIN_ROWS = 5
 REGISTRY_NAME = "sessions.csv"
 REGISTRY_SEARCH_LEVELS = 3
 REGISTRY_STATUSES = {"ok", "check", "exclude"}
@@ -31,17 +32,73 @@ SESSION_ID_IN_NAME = re.compile(r"(\d{8}_\d{6}_[0-9a-f]{8})_label[01]\.csv$")
 
 
 def find_registry(source: Path):
-    """Return the nearest sessions.csv at or above the data folder (ALIGN-data layout)."""
+    """Return the nearest sessions.csv at or above the data folder (ALIGN-data layout).
+
+    The search never leaves the Git repository that holds the data (it stops at the
+    folder containing .git), so ALIGN/data/... never picks up a sessions.csv placed
+    next to the ALIGN checkout.
+    """
     folder = source if source.is_dir() else source.parent
     for candidate in [folder, *folder.parents][:REGISTRY_SEARCH_LEVELS + 1]:
         path = candidate / REGISTRY_NAME
         if path.is_file():
             return path
+        if (candidate / ".git").exists():
+            break
+    return None
+
+
+def resolve_registry(source: Path, sessions_arg=None, no_sessions=False):
+    """Turn --sessions / --no-sessions into the registry path to use (or None)."""
+    if no_sessions:
+        return None
+    if sessions_arg:
+        path = Path(sessions_arg).expanduser().resolve()
+        if not path.is_file():
+            raise ValueError(f"세션 기록 파일이 없습니다: {path}")
+        return path
+    return find_registry(source)
+
+
+def add_registry_arguments(parser):
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--sessions", help="세션 기록 파일(sessions.csv). 생략하면 데이터 폴더부터 저장소 루트까지(최대 3단계) 자동으로 찾음")
+    group.add_argument("--no-sessions", action="store_true", help="sessions.csv를 무시하고 모든 세션 사용")
+
+
+def print_registry_report(registry_path, info):
+    if registry_path is None:
+        print("세션 기록(sessions.csv)을 사용하지 않았습니다. 폴더의 모든 세션을 씁니다.")
+        return
+    print(f"세션 기록: {registry_path} · 제외 {len(info['excluded'])}세션")
+    for item in info["excluded"]:
+        print(f"  제외: {item['session_id']} ({item['note'] or '사유 없음'})")
+    if info["check"]:
+        print(f"  확인 필요(check)로 표시된 세션 {len(info['check'])}개를 포함했습니다: "
+              + ", ".join(info["check"]))
+    if info["unregistered"]:
+        print(f"  경고: sessions.csv에 없는 세션 {len(info['unregistered'])}개를 포함했습니다: "
+              + ", ".join(info["unregistered"]))
+    for item in info["label_mismatch"]:
+        print(f"  경고: {item['session_id']} 라벨이 장부({item['registry_label']})와 "
+              f"CSV({item['csv_label']})에서 다릅니다. CSV 라벨로 학습합니다.")
+
+
+def peek_session_id(content: bytes):
+    """Read session_id from the first data row without parsing the whole file."""
+    try:
+        reader = csv.reader(io.StringIO(content.decode("utf-8-sig"), newline=""))
+        header = next(reader, None)
+        row = next(reader, None)
+    except (UnicodeDecodeError, csv.Error):
+        return None
+    if header and row and header[0] == "session_id" and row:
+        return row[0].strip() or None
     return None
 
 
 def load_registry(path: Path):
-    """Read session_id -> status/note from the ALIGN-data session registry."""
+    """Read session_id -> status/note/label from the ALIGN-data session registry."""
     try:
         text = path.read_text(encoding="utf-8-sig")
     except (OSError, UnicodeDecodeError) as exc:
@@ -54,10 +111,16 @@ def load_registry(path: Path):
         sid = (row.get("session_id") or "").strip()
         if not sid:
             continue
+        if sid in registry:
+            # 여러 명이 바로 push하는 장부라 중복 줄이 생기기 쉽다. 뒤 줄이 조용히 이기면
+            # exclude한 세션이 다시 학습에 들어갈 수 있으므로 멈춘다.
+            raise ValueError(f"{path.name}:{reader.line_num}: session_id {sid}가 중복입니다 "
+                             f"(처음 나온 줄: {registry[sid]['line']}). 한 줄로 합치세요.")
         status = (row.get("status") or "").strip()
         if status not in REGISTRY_STATUSES:
             raise ValueError(f"{path.name}:{reader.line_num}: status는 ok/check/exclude 중 하나여야 합니다.")
-        registry[sid] = {"status": status, "note": (row.get("note") or "").strip()}
+        registry[sid] = {"status": status, "note": (row.get("note") or "").strip(),
+                         "label": (row.get("label") or "").strip(), "line": reader.line_num}
     return registry
 
 
@@ -153,7 +216,8 @@ def read_session(name: str, content: bytes):
     if not rows:
         raise ValueError(f"{name}: 데이터 행이 없습니다.")
     for k in (0, 1):
-        if zero_rows[k] >= rows * ZERO_SENSOR_RATIO:
+        # 짧은 세션에서 0행 하나로 멈추지 않도록 최소 행 수도 함께 본다.
+        if zero_rows[k] >= max(rows * ZERO_SENSOR_RATIO, ZERO_SENSOR_MIN_ROWS):
             raise ValueError(
                 f"{name}: IMU{k + 1}의 6채널이 전부 0인 행이 {zero_rows[k]}/{rows}개입니다 (빈 센서 의심). "
                 f"sessions.csv에서 이 세션을 status=exclude로 표시하세요.")
@@ -183,16 +247,24 @@ def load_sessions(source: Path, registry="auto", report=None):
     entries = load_registry(Path(registry)) if registry else None
     info = {"registry": Path(registry).name if registry else None,
             "registry_sha256": hashlib.sha256(Path(registry).read_bytes()).hexdigest() if registry else None,
-            "excluded": [], "check": [], "unregistered": []}
+            "excluded": [], "check": [], "unregistered": [], "label_mismatch": []}
     sessions = []
     seen_ids, seen_signals, seen_files = {}, {}, {}
     for name, data in input_csvs(source):
-        match = SESSION_ID_IN_NAME.search(name)
-        entry = entries.get(match.group(1)) if entries is not None and match else None
-        if entry and entry["status"] == "exclude":
-            # Skip before parsing: excluded sessions are often the malformed ones.
-            info["excluded"].append({"session_id": match.group(1), "file": name, "note": entry["note"]})
+        base = Path(name).name
+        if base == REGISTRY_NAME or base.endswith(".labels.csv"):
+            # 장부와 구간 라벨 파일은 센서 기록이 아니다 (ALIGN-data 루트를 --data로 줄 때).
             continue
+        if entries is not None:
+            # Decide exclusion before parsing: excluded sessions are often the malformed
+            # ones (e.g. an empty sensor) and would otherwise stop read_session. Use the
+            # file name when it follows the logger pattern, else the CSV's first session_id.
+            match = SESSION_ID_IN_NAME.search(name)
+            sid = match.group(1) if match else peek_session_id(data)
+            entry = entries.get(sid) if sid else None
+            if entry and entry["status"] == "exclude":
+                info["excluded"].append({"session_id": sid, "file": name, "note": entry["note"]})
+                continue
         session = read_session(name, data)
         if entries is not None:
             entry = entries.get(session["session_id"])
@@ -201,8 +273,13 @@ def load_sessions(source: Path, registry="auto", report=None):
             elif entry["status"] == "exclude":
                 info["excluded"].append({"session_id": session["session_id"], "file": name, "note": entry["note"]})
                 continue
-            elif entry["status"] == "check":
-                info["check"].append(session["session_id"])
+            else:
+                if entry["status"] == "check":
+                    info["check"].append(session["session_id"])
+                if entry["label"] not in ("", str(session["label"])):
+                    info["label_mismatch"].append({"session_id": session["session_id"],
+                                                   "registry_label": entry["label"],
+                                                   "csv_label": session["label"]})
         for key, seen, message in (
                 ("session_id", seen_ids, "세션 ID가 중복"),
                 ("sha256", seen_files, "동일한 CSV 파일이 중복"),
@@ -311,27 +388,10 @@ def run(args):
         exists = [p for p in (out / "model.json", out / "evaluation.json") if p.exists()]
         if exists:
             raise ValueError(f"결과가 이미 있습니다: {exists[0]}. 새 --out 폴더를 사용하세요. 의도한 교체는 --overwrite로 실행합니다.")
-    if getattr(args, "no_sessions", False):
-        registry = None
-    elif getattr(args, "sessions", None):
-        registry = Path(args.sessions).expanduser().resolve()
-        if not registry.is_file():
-            raise ValueError(f"세션 기록 파일이 없습니다: {registry}")
-    else:
-        registry = "auto"
+    registry = resolve_registry(source, getattr(args, "sessions", None), getattr(args, "no_sessions", False))
     registry_info = {}
     sessions = load_sessions(source, registry, registry_info)
-    if registry_info.get("registry"):
-        print(f"세션 기록: {registry_info['registry']} 사용 · 제외 {len(registry_info['excluded'])}세션")
-        for item in registry_info["excluded"]:
-            print(f"  제외: {item['session_id']} ({item['note'] or '사유 없음'})")
-        if registry_info["check"]:
-            print(f"  확인 필요(check)로 표시된 세션 {len(registry_info['check'])}개를 포함했습니다: "
-                  + ", ".join(registry_info["check"]))
-        if registry_info["unregistered"]:
-            print(f"  경고: sessions.csv에 없는 세션 {len(registry_info['unregistered'])}개를 포함했습니다.")
-    else:
-        print("세션 기록(sessions.csv)을 사용하지 않았습니다. 폴더의 모든 세션을 학습에 씁니다.")
+    print_registry_report(registry, registry_info)
     evaluation = evaluate(sessions, args.split)
     public_sessions = [{k: v for k, v in s.items() if k not in ("features", "window_ends")} for s in sessions]
     evaluation["input_sessions"] = public_sessions
@@ -381,9 +441,7 @@ def main(argv=None):
     parser.add_argument("--split", choices=("session", "subject"), default="session")
     parser.add_argument("--out", required=True, help="새 결과 폴더")
     parser.add_argument("--overwrite", action="store_true", help="기존 model/evaluation 교체 허용")
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument("--sessions", help="세션 기록 파일(sessions.csv). 생략하면 데이터 폴더와 상위 3단계에서 자동으로 찾음")
-    group.add_argument("--no-sessions", action="store_true", help="sessions.csv를 무시하고 모든 세션 사용")
+    add_registry_arguments(parser)
     args = parser.parse_args(argv)
     try:
         run(args)
